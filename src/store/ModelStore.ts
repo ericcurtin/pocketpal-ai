@@ -28,6 +28,7 @@ import {getRecommendedProjectionModel} from '../utils/multimodalHelpers';
 import {defaultModels, MODEL_LIST_VERSION} from './defaultModels';
 
 import {downloadManager} from '../services/downloads';
+import {OCIRegistryClient} from '../services/oci';
 
 import {
   getHFDefaultSettings,
@@ -610,6 +611,7 @@ class ModelStore {
    * - PRESET: Checks both legacy path (DocumentDirectoryPath/filename) and
    *          new path (DocumentDirectoryPath/models/preset/author/filename)
    * - HF: Uses DocumentDirectoryPath/models/hf/author/filename
+   * - OCI: Uses DocumentDirectoryPath/models/oci/repository/filename
    *
    * @param model - The model object containing necessary metadata (origin, filename, author, etc.)
    * @returns Promise<string> - The full path where the model file is or should be stored
@@ -651,6 +653,14 @@ class ModelStore {
     if (model.origin === ModelOrigin.HF) {
       const author = model.author || 'unknown';
       return `${RNFS.DocumentDirectoryPath}/models/hf/${author}/${model.filename}`;
+    }
+
+    // For OCI models, use registry/repository structure
+    if (model.origin === ModelOrigin.OCI) {
+      // Extract repository from ID (e.g., docker.io/ai/llama3.1 -> ai/llama3.1)
+      const parts = model.id.split('/');
+      const repository = parts.slice(1).join('/');
+      return `${RNFS.DocumentDirectoryPath}/models/oci/${repository}/${model.filename}`;
     }
 
     // Fallback (shouldn't reach here)
@@ -753,16 +763,52 @@ class ModelStore {
 
   checkSpaceAndDownload = async (modelId: string) => {
     const model = this.models.find(m => m.id === modelId);
-    // Skip if model is undefined, already downloaded, local or doesn't have a download URL
-    // TODO: we need a better way to handle this. Why this could ever happen?
+    // Skip if model is undefined, already downloaded, or local
     if (
       !model ||
       model.isDownloaded ||
       model.isLocal ||
-      model.origin === ModelOrigin.LOCAL ||
-      !model.downloadUrl
+      model.origin === ModelOrigin.LOCAL
     ) {
       return;
+    }
+
+    // For OCI models, resolve the download URL if not already set
+    if (model.origin === ModelOrigin.OCI && !model.downloadUrl) {
+      try {
+        console.log('Resolving OCI download URL for model:', model.id);
+        const ociClient = new OCIRegistryClient();
+        const downloadInfo = await ociClient.getModelDownloadUrl(model.id);
+
+        // Update the model with download information
+        runInAction(() => {
+          model.downloadUrl = downloadInfo.url;
+          if (downloadInfo.size > 0) {
+            model.size = downloadInfo.size;
+          }
+        });
+
+        console.log('OCI download URL resolved:', {
+          url: downloadInfo.url,
+          size: downloadInfo.size,
+        });
+      } catch (err) {
+        console.error('Failed to resolve OCI download URL:', err);
+        const errorState = createErrorState(err, 'download', 'oci', {
+          modelId,
+        });
+
+        runInAction(() => {
+          this.downloadError = errorState;
+        });
+
+        throw err;
+      }
+    }
+
+    // Skip if model still doesn't have a download URL (shouldn't happen for valid models)
+    if (!model.downloadUrl) {
+      throw new Error('Model does not have a download URL');
     }
 
     try {
